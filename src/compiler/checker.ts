@@ -2395,7 +2395,7 @@ namespace ts {
                 }
                 else {
                     Debug.assert(!!(result.flags & SymbolFlags.ConstEnum));
-                    if (compilerOptions.preserveConstEnums) {
+                    if (shouldPreserveConstEnums(compilerOptions)) {
                         diagnosticMessage = error(errorLocation, Diagnostics.Enum_0_used_before_its_declaration, declarationName);
                     }
                 }
@@ -8202,7 +8202,7 @@ namespace ts {
             if (isParameter(declaration)) {
                 const func = <FunctionLikeDeclaration>declaration.parent;
                 // For a parameter of a set accessor, use the type of the get accessor if one is present
-                if (func.kind === SyntaxKind.SetAccessor && !hasNonBindableDynamicName(func)) {
+                if (func.kind === SyntaxKind.SetAccessor && hasBindableName(func)) {
                     const getter = getDeclarationOfKind<AccessorDeclaration>(getSymbolOfNode(declaration.parent), SyntaxKind.GetAccessor);
                     if (getter) {
                         const getterSignature = getSignatureFromDeclaration(getter);
@@ -9877,10 +9877,10 @@ namespace ts {
         }
 
         /**
-         * Indicates whether a declaration has a dynamic name that cannot be late-bound.
+         * Indicates whether a declaration has an early-bound name or a dynamic name that can be late-bound.
          */
-        function hasNonBindableDynamicName(node: Declaration) {
-            return hasDynamicName(node) && !hasLateBindableName(node);
+        function hasBindableName(node: Declaration) {
+            return !hasDynamicName(node) || hasLateBindableName(node);
         }
 
         /**
@@ -11827,7 +11827,7 @@ namespace ts {
 
                 // If only one accessor includes a this-type annotation, the other behaves as if it had the same type annotation
                 if ((declaration.kind === SyntaxKind.GetAccessor || declaration.kind === SyntaxKind.SetAccessor) &&
-                    !hasNonBindableDynamicName(declaration) &&
+                    hasBindableName(declaration) &&
                     (!hasThisParameter || !thisParameter)) {
                     const otherKind = declaration.kind === SyntaxKind.GetAccessor ? SyntaxKind.SetAccessor : SyntaxKind.GetAccessor;
                     const other = getDeclarationOfKind<AccessorDeclaration>(getSymbolOfNode(declaration), otherKind);
@@ -12051,7 +12051,7 @@ namespace ts {
             if (typeNode) {
                 return getTypeFromTypeNode(typeNode);
             }
-            if (declaration.kind === SyntaxKind.GetAccessor && !hasNonBindableDynamicName(declaration)) {
+            if (declaration.kind === SyntaxKind.GetAccessor && hasBindableName(declaration)) {
                 const jsDocType = isInJSFile(declaration) && getTypeForDeclarationFromJSDocComment(declaration);
                 if (jsDocType) {
                     return jsDocType;
@@ -12325,6 +12325,10 @@ namespace ts {
             return result;
         }
 
+        function getAliasId(aliasSymbol: Symbol | undefined, aliasTypeArguments: readonly Type[] | undefined) {
+            return aliasSymbol ? `@${getSymbolId(aliasSymbol)}` + (aliasTypeArguments ? `:${getTypeListId(aliasTypeArguments)}` : "") : "";
+        }
+
         // This function is used to propagate certain flags when creating new object type references and union types.
         // It is only necessary to do so if a constituent type might be the undefined type, the null type, the type
         // of an object literal or the anyFunctionType. This is because there are operations in the type checker
@@ -12453,7 +12457,7 @@ namespace ts {
             }
             const links = getSymbolLinks(symbol);
             const typeParameters = links.typeParameters!;
-            const id = getTypeListId(typeArguments) + (aliasSymbol ? `@${getSymbolId(aliasSymbol)}` : "");
+            const id = getTypeListId(typeArguments) + getAliasId(aliasSymbol, aliasTypeArguments);
             let instantiation = links.instantiations!.get(id);
             if (!instantiation) {
                 links.instantiations!.set(id, instantiation = instantiateTypeWithAlias(type,
@@ -13487,7 +13491,7 @@ namespace ts {
                 origin.flags & TypeFlags.Union ? `|${getTypeListId((<UnionType>origin).types)}` :
                 origin.flags & TypeFlags.Intersection ? `&${getTypeListId((<IntersectionType>origin).types)}` :
                 `#${(<IndexType>origin).type.id}`;
-            const id = typeKey + (aliasSymbol ? `@${getSymbolId(aliasSymbol)}` : "");
+            const id = typeKey + getAliasId(aliasSymbol, aliasTypeArguments);
             let type = unionTypes.get(id);
             if (!type) {
                 type = createUnionType(types, aliasSymbol, aliasTypeArguments, origin);
@@ -13724,7 +13728,7 @@ namespace ts {
             if (typeSet.length === 1) {
                 return typeSet[0];
             }
-            const id = getTypeListId(typeSet) + (aliasSymbol ? `@${getSymbolId(aliasSymbol)}` : "");
+            const id = getTypeListId(typeSet) + getAliasId(aliasSymbol, aliasTypeArguments);
             let result = intersectionTypes.get(id);
             if (!result) {
                 if (includes & TypeFlags.Union) {
@@ -14486,7 +14490,7 @@ namespace ts {
                     return objectType;
                 }
                 // Defer the operation by creating an indexed access type.
-                const id = objectType.id + "," + indexType.id + (shouldIncludeUndefined ? "?" : "") + (aliasSymbol ? `@${getSymbolId(aliasSymbol)}` : "");
+                const id = objectType.id + "," + indexType.id + (shouldIncludeUndefined ? "?" : "") + getAliasId(aliasSymbol, aliasTypeArguments);
                 let type = indexedAccessTypes.get(id);
                 if (!type) {
                     indexedAccessTypes.set(id, type = createIndexedAccessType(objectType, indexType, aliasSymbol, aliasTypeArguments, shouldIncludeUndefined));
@@ -14567,6 +14571,23 @@ namespace ts {
             return type;
         }
 
+        function isTypicalNondistributiveConditional(root: ConditionalRoot) {
+            return !root.isDistributive
+                && root.node.checkType.kind === SyntaxKind.TupleType
+                && length((root.node.checkType as TupleTypeNode).elements) === 1
+                && root.node.extendsType.kind === SyntaxKind.TupleType
+                && length((root.node.extendsType as TupleTypeNode).elements) === 1;
+        }
+
+        /**
+         * We syntactually check for common nondistributive conditional shapes and unwrap them into
+         * the intended comparison - we do this so we can check if the unwrapped types are generic or
+         * not and appropriately defer condition calculation
+         */
+        function unwrapNondistributiveConditionalTuple(root: ConditionalRoot, type: Type) {
+            return isTypicalNondistributiveConditional(root) && isTupleType(type) ? getTypeArguments(type)[0] : type;
+        }
+
         function getConditionalType(root: ConditionalRoot, mapper: TypeMapper | undefined, aliasSymbol?: Symbol, aliasTypeArguments?: readonly Type[]): Type {
             let result;
             let extraTypes: Type[] | undefined;
@@ -14574,9 +14595,9 @@ namespace ts {
             // types of the form 'A extends B ? X : C extends D ? Y : E extends F ? Z : ...' as a single construct for
             // purposes of resolution. This means such types aren't subject to the instatiation depth limiter.
             while (true) {
-                const checkType = instantiateType(root.checkType, mapper);
+                const checkType = instantiateType(unwrapNondistributiveConditionalTuple(root, root.checkType), mapper);
                 const checkTypeInstantiable = isGenericObjectType(checkType) || isGenericIndexType(checkType);
-                const extendsType = instantiateType(root.extendsType, mapper);
+                const extendsType = instantiateType(unwrapNondistributiveConditionalTuple(root, root.extendsType), mapper);
                 if (checkType === wildcardType || extendsType === wildcardType) {
                     return wildcardType;
                 }
@@ -14599,9 +14620,9 @@ namespace ts {
                     // types with type parameters mapped to the wildcard type, the most permissive instantiations
                     // possible (the wildcard type is assignable to and from all types). If those are not related,
                     // then no instantiations will be and we can just return the false branch type.
-                    if (!(inferredExtendsType.flags & TypeFlags.AnyOrUnknown) && (checkType.flags & TypeFlags.Any || !isTypeAssignableTo(getPermissiveInstantiation(checkType), getPermissiveInstantiation(inferredExtendsType)))) {
+                    if (!(inferredExtendsType.flags & TypeFlags.AnyOrUnknown) && ((checkType.flags & TypeFlags.Any && root.isDistributive) || !isTypeAssignableTo(getPermissiveInstantiation(checkType), getPermissiveInstantiation(inferredExtendsType)))) {
                         // Return union of trueType and falseType for 'any' since it matches anything
-                        if (checkType.flags & TypeFlags.Any) {
+                        if (checkType.flags & TypeFlags.Any && root.isDistributive) {
                             (extraTypes || (extraTypes = [])).push(instantiateType(getTypeFromTypeNode(root.node.trueType), combinedMapper || mapper));
                         }
                         // If falseType is an immediately nested conditional type that isn't distributive or has an
@@ -14630,8 +14651,8 @@ namespace ts {
                 // Return a deferred type for a check that is neither definitely true nor definitely false
                 result = <ConditionalType>createType(TypeFlags.Conditional);
                 result.root = root;
-                result.checkType = checkType;
-                result.extendsType = extendsType;
+                result.checkType = instantiateType(root.checkType, mapper);
+                result.extendsType = instantiateType(root.extendsType, mapper);
                 result.mapper = mapper;
                 result.combinedMapper = combinedMapper;
                 result.aliasSymbol = aliasSymbol || root.aliasSymbol;
@@ -15464,15 +15485,15 @@ namespace ts {
                 const combinedMapper = combineTypeMappers(type.mapper, mapper);
                 const typeArguments = map(typeParameters, t => getMappedType(t, combinedMapper));
                 const newAliasSymbol = aliasSymbol || type.aliasSymbol;
-                const id = getTypeListId(typeArguments) + (newAliasSymbol ? `@${getSymbolId(newAliasSymbol)}` : "");
+                const newAliasTypeArguments = aliasSymbol ? aliasTypeArguments : instantiateTypes(type.aliasTypeArguments, mapper);
+                const id = getTypeListId(typeArguments) + getAliasId(newAliasSymbol, newAliasTypeArguments);
                 if (!target.instantiations) {
                     target.instantiations = new Map<string, Type>();
-                    target.instantiations.set(getTypeListId(typeParameters) + (target.aliasSymbol ? `@${getSymbolId(target.aliasSymbol)}` : ""), target);
+                    target.instantiations.set(getTypeListId(typeParameters) + getAliasId(target.aliasSymbol, target.aliasTypeArguments), target);
                 }
                 let result = target.instantiations.get(id);
                 if (!result) {
                     const newMapper = createTypeMapper(typeParameters, typeArguments);
-                    const newAliasTypeArguments = aliasSymbol ? aliasTypeArguments : instantiateTypes(type.aliasTypeArguments, mapper);
                     result = target.objectFlags & ObjectFlags.Reference ? createDeferredTypeReference((<DeferredTypeReference>type).target, (<DeferredTypeReference>type).node, newMapper, newAliasSymbol, newAliasTypeArguments) :
                         target.objectFlags & ObjectFlags.Mapped ? instantiateMappedType(<MappedType>target, newMapper, newAliasSymbol, newAliasTypeArguments) :
                         instantiateAnonymousType(target, newMapper, newAliasSymbol, newAliasTypeArguments);
@@ -15640,7 +15661,7 @@ namespace ts {
                 // mapper to the type parameters to produce the effective list of type arguments, and compute the
                 // instantiation cache key from the type IDs of the type arguments.
                 const typeArguments = map(root.outerTypeParameters, t => getMappedType(t, mapper));
-                const id = getTypeListId(typeArguments) + (aliasSymbol ? `@${getSymbolId(aliasSymbol)}` : "");
+                const id = getTypeListId(typeArguments) + getAliasId(aliasSymbol, aliasTypeArguments);
                 let result = root.instantiations!.get(id);
                 if (!result) {
                     const newMapper = createTypeMapper(root.outerTypeParameters, typeArguments);
@@ -23198,7 +23219,13 @@ namespace ts {
             if (isNonLocalAlias(symbol, /*excludes*/ SymbolFlags.Value) && !isInTypeQuery(location) && !getTypeOnlyAliasDeclaration(symbol)) {
                 const target = resolveAlias(symbol);
                 if (target.flags & SymbolFlags.Value) {
-                    if (compilerOptions.preserveConstEnums && isExportOrExportExpression(location) || !isConstEnumOrConstEnumOnlyModule(target)) {
+                    // An alias resolving to a const enum cannot be elided if (1) 'isolatedModules' is enabled
+                    // (because the const enum value will not be inlined), or if (2) the alias is an export
+                    // of a const enum declaration that will be preserved.
+                    if (compilerOptions.isolatedModules ||
+                        shouldPreserveConstEnums(compilerOptions) && isExportOrExportExpression(location) ||
+                        !isConstEnumOrConstEnumOnlyModule(target)
+                    ) {
                         markAliasSymbolAsReferenced(symbol);
                     }
                     else {
@@ -24397,7 +24424,7 @@ namespace ts {
             const objectLiteral = <ObjectLiteralExpression>element.parent;
             const type = getApparentTypeOfContextualType(objectLiteral, contextFlags);
             if (type) {
-                if (!hasNonBindableDynamicName(element)) {
+                if (hasBindableName(element)) {
                     // For a (non-symbol) computed property, there is no reason to look up the name
                     // in the type. It will just be "__computed", which does not appear in any
                     // SymbolTable.
@@ -24748,15 +24775,18 @@ namespace ts {
         function getJsxManagedAttributesFromLocatedAttributes(context: JsxOpeningLikeElement, ns: Symbol, attributesType: Type) {
             const managedSym = getJsxLibraryManagedAttributes(ns);
             if (managedSym) {
-                const declaredManagedType = getDeclaredTypeOfSymbol(managedSym);
+                const declaredManagedType = getDeclaredTypeOfSymbol(managedSym); // fetches interface type, or initializes symbol links type parmaeters
                 const ctorType = getStaticTypeOfReferencedJsxConstructor(context);
+                if (managedSym.flags & SymbolFlags.TypeAlias) {
+                    const params = getSymbolLinks(managedSym).typeParameters;
+                    if (length(params) >= 2) {
+                        const args = fillMissingTypeArguments([ctorType, attributesType], params, 2, isInJSFile(context));
+                        return getTypeAliasInstantiation(managedSym, args);
+                    }
+                }
                 if (length((declaredManagedType as GenericType).typeParameters) >= 2) {
                     const args = fillMissingTypeArguments([ctorType, attributesType], (declaredManagedType as GenericType).typeParameters, 2, isInJSFile(context));
                     return createTypeReference((declaredManagedType as GenericType), args);
-                }
-                else if (length(declaredManagedType.aliasTypeArguments) >= 2) {
-                    const args = fillMissingTypeArguments([ctorType, attributesType], declaredManagedType.aliasTypeArguments, 2, isInJSFile(context));
-                    return getTypeAliasInstantiation(declaredManagedType.aliasSymbol!, args);
                 }
             }
             return attributesType;
@@ -26254,7 +26284,11 @@ namespace ts {
                 }
                 prop = getPropertyOfType(apparentType, right.escapedText);
             }
-            if (isIdentifier(left) && parentSymbol && !(prop && isConstEnumOrConstEnumOnlyModule(prop))) {
+            // In `Foo.Bar.Baz`, 'Foo' is not referenced if 'Bar' is a const enum or a module containing only const enums.
+            // The exceptions are:
+            //   1. if 'isolatedModules' is enabled, because the const enum value will not be inlined, and
+            //   2. if 'preserveConstEnums' is enabled and the expression is itself an export, e.g. `export = Foo.Bar.Baz`.
+            if (isIdentifier(left) && parentSymbol && (compilerOptions.isolatedModules || !(prop && isConstEnumOrConstEnumOnlyModule(prop)) || shouldPreserveConstEnums(compilerOptions) && isExportOrExportExpression(node))) {
                 markAliasReferenced(parentSymbol, node);
             }
 
@@ -32288,7 +32322,7 @@ namespace ts {
                 if (isPrivateIdentifier(node.name)) {
                     error(node.name, Diagnostics.An_accessor_cannot_be_named_with_a_private_identifier);
                 }
-                if (!hasNonBindableDynamicName(node)) {
+                if (hasBindableName(node)) {
                     // TypeScript 1.0 spec (April 2014): 8.4.3
                     // Accessors for the same member name must specify the same accessibility.
                     const otherKind = node.kind === SyntaxKind.GetAccessor ? SyntaxKind.SetAccessor : SyntaxKind.GetAccessor;
@@ -33614,7 +33648,7 @@ namespace ts {
                 checkComputedPropertyName(node.name);
             }
 
-            if (!hasNonBindableDynamicName(node)) {
+            if (hasBindableName(node)) {
                 // first we want to check the local symbol that contain this declaration
                 // - if node.localSymbol !== undefined - this is current declaration is exported and localSymbol points to the local symbol
                 // - if node.localSymbol === undefined - this node is non-exported so we can just pick the result of getSymbolOfNode
@@ -33839,13 +33873,16 @@ namespace ts {
         }
 
         function isValidUnusedLocalDeclaration(declaration: Declaration): boolean {
-            if (isBindingElement(declaration) && isIdentifierThatStartsWithUnderscore(declaration.name)) {
-                return !!findAncestor(declaration.parent, ancestor =>
-                    isArrayBindingPattern(ancestor) || isVariableDeclaration(ancestor) || isVariableDeclarationList(ancestor) ? false :
-                        isForOfStatement(ancestor) ? true : "quit"
-                );
+            if (isBindingElement(declaration)) {
+                if (isObjectBindingPattern(declaration.parent)) {
+                    /**
+                     * ignore starts with underscore names _
+                     * const { a: _a } = { a: 1 }
+                     */
+                    return !!(declaration.propertyName && isIdentifierThatStartsWithUnderscore(declaration.name));
+                }
+                return isIdentifierThatStartsWithUnderscore(declaration.name);
             }
-
             return isAmbientModule(declaration) ||
                 (isVariableDeclaration(declaration) && isForInOrOfStatement(declaration.parent.parent) || isImportedDeclaration(declaration)) && isIdentifierThatStartsWithUnderscore(declaration.name!);
         }
@@ -35614,7 +35651,7 @@ namespace ts {
                         // Only process instance properties with computed names here.
                         // Static properties cannot be in conflict with indexers,
                         // and properties with literal names were already checked.
-                        if (!hasSyntacticModifier(member, ModifierFlags.Static) && hasNonBindableDynamicName(member)) {
+                        if (!hasSyntacticModifier(member, ModifierFlags.Static) && !hasBindableName(member)) {
                             const symbol = getSymbolOfNode(member);
                             const propType = getTypeOfSymbol(symbol);
                             checkIndexConstraintForProperty(symbol, propType, type, declaredStringIndexer, stringIndexType, IndexKind.String);
@@ -36628,7 +36665,7 @@ namespace ts {
                 if (symbol.flags & SymbolFlags.ValueModule
                     && !inAmbientContext
                     && symbol.declarations.length > 1
-                    && isInstantiatedModule(node, !!compilerOptions.preserveConstEnums || !!compilerOptions.isolatedModules)) {
+                    && isInstantiatedModule(node, shouldPreserveConstEnums(compilerOptions))) {
                     const firstNonAmbientClassOrFunc = getFirstNonAmbientClassOrFunctionDeclaration(symbol);
                     if (firstNonAmbientClassOrFunc) {
                         if (getSourceFileOfNode(node) !== getSourceFileOfNode(firstNonAmbientClassOrFunc)) {
@@ -38551,7 +38588,7 @@ namespace ts {
             // const enums and modules that contain only const enums are not considered values from the emit perspective
             // unless 'preserveConstEnums' option is set to true
             return !!(target.flags & SymbolFlags.Value) &&
-                (compilerOptions.preserveConstEnums || !isConstEnumOrConstEnumOnlyModule(target));
+                (shouldPreserveConstEnums(compilerOptions) || !isConstEnumOrConstEnumOnlyModule(target));
         }
 
         function isConstEnumOrConstEnumOnlyModule(s: Symbol): boolean {
@@ -38561,13 +38598,14 @@ namespace ts {
         function isReferencedAliasDeclaration(node: Node, checkChildren?: boolean): boolean {
             if (isAliasSymbolDeclaration(node)) {
                 const symbol = getSymbolOfNode(node);
-                if (symbol && getSymbolLinks(symbol).referenced) {
+                const links = symbol && getSymbolLinks(symbol);
+                if (links?.referenced) {
                     return true;
                 }
                 const target = getSymbolLinks(symbol!).target; // TODO: GH#18217
                 if (target && getEffectiveModifierFlags(node) & ModifierFlags.Export &&
                     target.flags & SymbolFlags.Value &&
-                    (compilerOptions.preserveConstEnums || !isConstEnumOrConstEnumOnlyModule(target))) {
+                    (shouldPreserveConstEnums(compilerOptions) || !isConstEnumOrConstEnumOnlyModule(target))) {
                     // An `export import ... =` of a value symbol is always considered referenced
                     return true;
                 }
